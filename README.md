@@ -164,7 +164,7 @@ class MetaShape {
 
 Le modèle de données du Rock est particulièrement important car il définit toutes les informations nécessaires pour exécuter et suivre un appel asynchrone avec sa stratégie de réessai.
 
-_Cette documentation est une mise à jour._
+_Cette documentation a été mise à jour automatiquement._
 
 [1]: https://github.com/Xcraft-Inc/xcraft-core-goblin
 [2]: https://github.com/Xcraft-Inc/xcraft-core-stones
