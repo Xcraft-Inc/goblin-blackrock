@@ -76,8 +76,8 @@ async breakSomething() {
 
 ## Interactions avec d'autres modules
 
-- [**xcraft-core-goblin**][1] : Utilise le framework Elf pour la définition des acteurs et la gestion de l'état
-- [**xcraft-core-stones**][2] : Utilise les types de données pour définir les formes (shapes) des états
+- **[xcraft-core-goblin]** : Utilise le framework Elf pour la définition des acteurs et la gestion de l'état
+- **[xcraft-core-stones]** : Utilise les types de données pour définir les formes (shapes) des états
 - **Système d'événements Xcraft** : Utilise les événements pour notifier les consommateurs des résultats
 - **Système de persistance Cryo** : Utilise la persistance pour stocker et récupérer les rocks non traités
 
@@ -166,5 +166,5 @@ Le modèle de données du Rock est particulièrement important car il définit t
 
 _Cette documentation a été mise à jour automatiquement._
 
-[1]: https://github.com/Xcraft-Inc/xcraft-core-goblin
-[2]: https://github.com/Xcraft-Inc/xcraft-core-stones
+[xcraft-core-goblin]: https://github.com/Xcraft-Inc/xcraft-core-goblin
+[xcraft-core-stones]: https://github.com/Xcraft-Inc/xcraft-core-stones
