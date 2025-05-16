@@ -97,6 +97,12 @@ L'acteur s'abonne également aux événements `<kill-the-rock>` pour nettoyer le
 
 La méthode `init()` utilise le système de requêtes Cryo pour rechercher les rocks non traités (où `processed` est `false` et `retries` n'est pas `0`) et relance leur traitement.
 
+#### Méthodes publiques
+
+- **`init()`** - Initialise l'acteur Blackrock, récupère les rocks non traités et configure les souscriptions aux événements.
+- **`hurl(baseId, eventScope, goblinName, questName, params, retries)`** - Lance un nouvel appel asynchrone avec stratégie de réessai. Crée un Rock avec l'ID spécifié et démarre son traitement.
+- **`break(baseId)`** - Annule un appel en cours en mettant à la corbeille le Rock correspondant.
+
 ### `rock.js`
 
 Ce fichier définit l'acteur `Rock` qui représente un appel spécifique à exécuter avec sa stratégie de réessai. Il contient :
@@ -115,6 +121,17 @@ Les méthodes principales de l'acteur Rock sont :
 - **setError()** : Enregistre une erreur survenue lors de l'exécution
 - **trash()** : Marque un rock comme supprimé et arrête son exécution
 - **delete()** et **dispose()** : Nettoient les ressources lors de la suppression de l'acteur
+
+#### Méthodes publiques
+
+- **`create(id, desktopId)`** - Crée un nouveau Rock avec l'ID spécifié et le persiste.
+- **`upsert(eventScope, goblinName, questName, params, retries)`** - Met à jour les paramètres d'un Rock existant si celui-ci n'est pas déjà en cours de traitement.
+- **`process(initialDelay = false)`** - Démarre l'exécution de l'appel avec la stratégie de réessai. Si `initialDelay` est vrai, attend un intervalle avant la première tentative.
+- **`done()`** - Marque un Rock comme traité avec succès et émet un événement pour le supprimer.
+- **`setError(error)`** - Enregistre une erreur survenue lors de l'exécution.
+- **`trash()`** - Marque un Rock comme supprimé, arrête son exécution et émet un événement pour le supprimer.
+- **`delete()`** - Nettoie les ressources lors de la suppression de l'acteur.
+- **`dispose()`** - Nettoie les ressources lors de la fermeture de l'application.
 
 ### `Launcher` (classe interne)
 
