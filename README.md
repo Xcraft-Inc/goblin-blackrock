@@ -4,6 +4,18 @@
 
 Le module `goblin-blackrock` est un système robuste de gestion d'appels asynchrones avec stratégie de réessai automatique dans l'écosystème Xcraft. Il permet d'exécuter des tâches (quêtes) de manière fiable, même en cas d'échec temporaire, en réessayant automatiquement selon une stratégie configurable. Ce module est particulièrement utile pour les opérations qui nécessitent une garantie d'exécution dans un environnement distribué ou sujet à des défaillances.
 
+## Sommaire
+
+- [Structure du module](#structure-du-module)
+- [Fonctionnement global](#fonctionnement-global)
+- [Acteurs](#acteurs)
+  - [Blackrock (Singleton)](#blackrock-singleton)
+  - [Rock (Instanciable)](#rock-instanciable)
+- [Classe Launcher](#classe-launcher)
+- [Exemples d'utilisation](#exemples-dutilisation)
+- [Interactions avec d'autres modules](#interactions-avec-dautres-modules)
+- [Détails des sources](#détails-des-sources)
+
 ## Structure du module
 
 Le module est composé de deux acteurs principaux implémentés selon le modèle Elf du framework Xcraft :
@@ -24,6 +36,111 @@ Le système fonctionne sur le principe de "lancer des roches" (hurl rocks) qui r
 5. Les `Rock` sont persistés dans une base de données (via `Elf.Archetype`), ce qui permet de reprendre les appels non traités après un redémarrage
 
 Le module utilise un système d'événements pour notifier les consommateurs du résultat des appels, qu'ils soient réussis ou échoués, en émettant des événements dans le format `<eventScope-rock-processed>`.
+
+## Acteurs
+
+### Blackrock (Singleton)
+
+L'acteur `Blackrock` est un singleton (`Elf.Alone`) qui orchestre l'ensemble du système de gestion des appels asynchrones.
+
+#### État
+
+```javascript
+class BlackrockShape {
+  id = string;
+}
+```
+
+L'état de Blackrock est minimal, ne contenant qu'un identifiant fixe : `'blackrock'`.
+
+#### Cycle de vie
+
+**`init()`** - Méthode d'initialisation appelée au démarrage qui :
+- Récupère tous les rocks non traités depuis la base de données (où `processed` est `false` et `retries` n'est pas `0`)
+- Relance leur traitement automatiquement
+- Configure la souscription aux événements `<kill-the-rock>` pour nettoyer les ressources
+
+#### Méthodes principales
+
+**`hurl(baseId, eventScope, goblinName, questName, params, retries)`**
+Lance un nouvel appel asynchrone avec stratégie de réessai.
+
+- `baseId` : Identifiant de base pour cette opération
+- `eventScope` : Portée d'événement pour les notifications
+- `goblinName` : Nom du goblin cible
+- `questName` : Nom de la quête à exécuter
+- `params` : Paramètres de la quête
+- `retries` : Nombre de tentatives (`null`/`undefined` pour infini)
+
+**`break(baseId)`**
+Annule un appel en cours en récupérant le Rock correspondant et en appelant sa méthode `trash()`. L'opération de suppression est différée pour éviter les conflits de concurrence.
+
+### Rock (Instanciable)
+
+L'acteur `Rock` représente un appel spécifique à exécuter avec sa stratégie de réessai. Il hérite d'`Elf.Archetype` pour la persistance.
+
+#### État
+
+```javascript
+class RockShape {
+  id = string;                    // Identifiant unique du rock
+  meta = MetaShape;               // Métadonnées avec statut
+  eventScope = string;            // Portée d'événement pour les notifications
+  goblinName = string;            // Nom du goblin cible
+  questName = string;             // Nom de la quête à exécuter
+  params = option(object);        // Paramètres de la quête (optionnel)
+  processed = boolean;            // Indique si le rock a été traité
+  retries = option(number);       // Nombre de tentatives restantes
+  error = option(string);         // Dernière erreur rencontrée (optionnel)
+}
+
+class MetaShape {
+  status = enumeration('published', 'trashed');
+}
+```
+
+#### Cycle de vie
+
+**`create(id, desktopId)`** - Crée un nouveau Rock avec l'ID spécifié et le persiste immédiatement.
+
+**`delete()`** et **`dispose()`** - Nettoient les ressources en arrêtant le launcher.
+
+#### Méthodes principales
+
+**`upsert(eventScope, goblinName, questName, params, retries)`**
+Met à jour les paramètres d'un Rock existant si celui-ci n'est pas déjà en cours de traitement.
+
+**`process(initialDelay = false)`**
+Démarre l'exécution de l'appel avec la stratégie de réessai. Crée un `Launcher` qui gère les tentatives et écoute les événements de succès/échec.
+
+**`done()`**
+Marque un Rock comme traité avec succès, supprime l'erreur éventuelle et émet un événement `<kill-the-rock>`.
+
+**`setError(error)`**
+Enregistre une erreur survenue lors de l'exécution.
+
+**`trash()`**
+Marque un Rock comme supprimé, arrête le launcher et émet un événement `<kill-the-rock>`.
+
+## Classe Launcher
+
+La classe `Launcher` est un composant clé qui étend `EventEmitter` et gère l'exécution des appels avec la stratégie de réessai :
+
+### Caractéristiques
+
+- **Intervalle de réessai** : 30 secondes entre chaque tentative
+- **Gestion des tentatives** : Décrémente le compteur de `retries` à chaque échec (si défini)
+- **Délai initial** : Optionnel, permet d'attendre avant la première exécution
+- **Événements** : Émet 'success' avec le résultat ou 'error' avec l'erreur
+- **Arrêt automatique** : S'arrête en cas de succès ou d'épuisement des tentatives
+
+### Méthodes
+
+**`constructor(context, goblinName, questName, params, options)`**
+Initialise le launcher avec les paramètres d'appel et démarre l'exécution.
+
+**`stop()`**
+Arrête le launcher et nettoie les timers.
 
 ## Exemples d'utilisation
 
@@ -72,6 +189,15 @@ async breakSomething() {
 }
 ```
 
+### Appel avec délai initial
+
+```javascript
+// Lancer un appel avec un délai de 30 secondes avant la première tentative
+const rock = await new Rock(this).create('delayed-operation', desktopId);
+await rock.upsert('myScope', 'myGoblin', 'delayedQuest', {data: 'test'}, 3);
+await rock.process(true); // true pour activer le délai initial
+```
+
 ## Interactions avec d'autres modules
 
 - **[xcraft-core-goblin]** : Utilise le framework Elf pour la définition des acteurs et la gestion de l'état
@@ -96,75 +222,13 @@ Ce fichier expose les commandes Xcraft pour l'acteur `Rock` via `Elf.birth()`, p
 
 Ce fichier définit l'acteur `Blackrock` et sa logique associée `BlackrockLogic`. En tant que singleton (`Elf.Alone`), il est responsable de l'orchestration des appels asynchrones avec réessai.
 
-#### État et modèle de données
-
-L'état de Blackrock est minimal, ne contenant qu'un identifiant fixe :
-
-```javascript
-class BlackrockShape {
-  id = string;
-}
-```
-
-#### Méthodes publiques
-
-**`init()`** - Initialise l'acteur Blackrock au démarrage. Cette méthode récupère tous les rocks non traités depuis la base de données (où `processed` est `false` et `retries` n'est pas `0`) et relance leur traitement. Elle configure également la souscription aux événements `<kill-the-rock>` pour nettoyer les ressources.
-
-**`hurl(baseId, eventScope, goblinName, questName, params, retries)`** - Lance un nouvel appel asynchrone avec stratégie de réessai. Crée un Rock avec l'ID spécifié (`rock@<baseId>`), configure ses paramètres via `upsert()` et démarre immédiatement son traitement.
-
-**`break(baseId)`** - Annule un appel en cours en récupérant le Rock correspondant et en appelant sa méthode `trash()`. L'opération de suppression est différée pour éviter les conflits de concurrence.
-
 ### `lib/rock.js`
 
-Ce fichier contient la logique principale du système avec l'acteur `Rock`, sa logique `RockLogic` et la classe utilitaire `Launcher`.
-
-#### État et modèle de données
-
-```javascript
-class RockShape {
-  id = string;                    // Identifiant unique du rock
-  meta = MetaShape;              // Métadonnées avec statut (published/trashed)
-  eventScope = string;           // Portée d'événement pour les notifications
-  goblinName = string;           // Nom du goblin cible
-  questName = string;            // Nom de la quête à exécuter
-  params = option(object);       // Paramètres de la quête (optionnel)
-  processed = boolean;           // Indique si le rock a été traité
-  retries = option(number);      // Nombre de tentatives restantes (undefined = infini)
-  error = option(string);        // Dernière erreur rencontrée (optionnel)
-}
-
-class MetaShape {
-  status = enumeration('published', 'trashed');
-}
-```
-
-#### Méthodes publiques
-
-**`create(id, desktopId)`** - Crée un nouveau Rock avec l'ID spécifié et le persiste immédiatement dans la base de données. Retourne l'instance pour permettre le chaînage.
-
-**`upsert(eventScope, goblinName, questName, params, retries)`** - Met à jour les paramètres d'un Rock existant si celui-ci n'est pas déjà en cours de traitement. Remet le statut à 'published' et `processed` à `false` pour permettre un nouveau traitement.
-
-**`process(initialDelay = false)`** - Démarre l'exécution de l'appel avec la stratégie de réessai. Si `initialDelay` est vrai, attend 30 secondes avant la première tentative. Crée un `Launcher` qui gère les tentatives et écoute les événements de succès/échec.
-
-**`done()`** - Marque un Rock comme traité avec succès, supprime l'erreur éventuelle, persiste l'état et émet un événement `<kill-the-rock>` pour déclencher sa suppression.
-
-**`setError(error)`** - Enregistre une erreur survenue lors de l'exécution et persiste l'état.
-
-**`trash()`** - Marque un Rock comme supprimé (statut 'trashed'), arrête le launcher s'il existe, persiste l'état et émet un événement `<kill-the-rock>`.
-
-**`delete()`** et **`dispose()`** - Nettoient les ressources en arrêtant le launcher lors de la suppression de l'acteur ou de la fermeture de l'application.
-
-#### Classe Launcher
-
-La classe `Launcher` est un composant clé qui étend `EventEmitter` et gère l'exécution des appels avec la stratégie de réessai :
-
-- **Intervalle de réessai** : 30 secondes entre chaque tentative
-- **Gestion des tentatives** : Décrémente le compteur de `retries` à chaque échec (si défini)
-- **Délai initial** : Optionnel, permet d'attendre avant la première exécution
-- **Événements** : Émet 'success' avec le résultat ou 'error' avec l'erreur
-- **Arrêt automatique** : S'arrête en cas de succès ou d'épuisement des tentatives
+Ce fichier contient la logique principale du système avec l'acteur `Rock`, sa logique `RockLogic` et la classe utilitaire `Launcher`. Il implémente la persistance via `Elf.Archetype` avec la base de données 'rock'.
 
 Cette implémentation garantit que les appels sont exécutés de manière fiable, même en cas de défaillances temporaires du système, avec une stratégie de réessai configurable et une gestion propre des ressources.
+
+---
 
 _Cette documentation a été mise à jour automatiquement._
 
