@@ -1,8 +1,8 @@
-# 📘 Documentation du module goblin-blackrock
+# 📘 goblin-blackrock
 
 ## Aperçu
 
-Le module `goblin-blackrock` est un système robuste de gestion d'appels asynchrones avec stratégie de réessai automatique dans l'écosystème Xcraft. Il permet d'exécuter des tâches (quêtes) de manière fiable, même en cas d'échec temporaire, en réessayant automatiquement selon une stratégie configurable. Ce module est particulièrement utile pour les opérations qui nécessitent une garantie d'exécution dans un environnement distribué ou sujet à des défaillances.
+Le module `goblin-blackrock` est un système robuste de gestion d'appels asynchrones avec stratégie de réessai automatique dans l'écosystème Xcraft. Il permet d'exécuter des tâches (quêtes Xcraft) de manière fiable, même en cas d'échec temporaire, en réessayant automatiquement toutes les 30 secondes selon une stratégie configurable. Ce module est particulièrement utile pour les opérations qui nécessitent une garantie d'exécution dans un environnement distribué ou sujet à des défaillances transitoires.
 
 ## Sommaire
 
@@ -11,59 +11,82 @@ Le module `goblin-blackrock` est un système robuste de gestion d'appels asynchr
 - [Exemples d'utilisation](#exemples-dutilisation)
 - [Interactions avec d'autres modules](#interactions-avec-dautres-modules)
 - [Détails des sources](#détails-des-sources)
+- [Licence](#licence)
 
 ## Structure du module
 
 Le module est composé de deux acteurs principaux implémentés selon le modèle Elf du framework Xcraft :
 
-1. **Blackrock** - Un acteur singleton (`Elf.Alone`) qui gère l'orchestration globale des appels asynchrones
-2. **Rock** - Un acteur instanciable (`Elf`) qui représente un appel spécifique à exécuter avec sa stratégie de réessai
+1. **Blackrock** — Un acteur singleton (`Elf.Alone`) qui orchestre globalement les appels asynchrones. Il est le point d'entrée public du module.
+2. **Rock** — Un acteur instanciable (`Elf`) persisté via `Elf.Archetype` qui représente un appel spécifique à exécuter avec sa stratégie de réessai.
 
-Ces acteurs suivent une architecture claire avec séparation entre la logique métier (classes `BlackrockLogic` et `RockLogic`) et l'état (classes `BlackrockState` et `RockState`).
+Ces acteurs suivent une architecture claire avec séparation entre la logique métier (`BlackrockLogic`, `RockLogic`) et l'état (`BlackrockState`, `RockState`).
+
+La classe interne `Launcher` (non exposée publiquement) gère l'exécution concrète des tentatives via un `EventEmitter`.
 
 ## Fonctionnement global
 
-Le système fonctionne sur le principe de "lancer des roches" (hurl rocks) qui représentent des appels à des quêtes spécifiques :
+Le système fonctionne sur le principe de « lancer des roches » (_hurl rocks_) représentant des appels à des quêtes Xcraft :
 
-1. **Initialisation** : Au démarrage, `Blackrock` récupère tous les rocks non traités depuis la base de données et relance leur traitement automatiquement
-2. **Création d'appels** : Lorsqu'un appel doit être effectué avec une stratégie de réessai, `Blackrock` crée un nouvel acteur `Rock`
-3. **Encapsulation** : Le `Rock` encapsule les détails de l'appel (goblin cible, nom de la quête, paramètres) et sa stratégie de réessai
-4. **Exécution** : Un `Launcher` interne (implémenté comme une classe `EventEmitter`) gère l'exécution de l'appel et les tentatives de réessai en cas d'échec
-5. **Notification** : Les événements de succès ou d'échec sont émis pour permettre aux consommateurs de réagir en conséquence
-6. **Persistance** : Les `Rock` sont persistés dans une base de données (via `Elf.Archetype`), ce qui permet de reprendre les appels non traités après un redémarrage
+```
+[Client]
+   │
+   ▼
+Blackrock.hurl(baseId, eventScope, goblinName, questName, params, retries)
+   │
+   ├─► Crée/récupère un Rock (rock@<baseId>)
+   │       │
+   │       └─► Persiste l'état dans la DB 'rock'
+   │
+   └─► Rock.process()
+           │
+           └─► Launcher (EventEmitter)
+                   │
+                   ├─► Exécute quest.cmd(`${goblinName}.${questName}`, params)
+                   │       ├── Succès ──► Rock.done() ──► evt(<kill-the-rock>)
+                   │       │                           ──► evt(<eventScope-rock-processed>)
+                   │       └── Échec ──► Rock.setError()
+                   │                 ──► evt(<eventScope-rock-processed>, {error})
+                   │                 └── Réessai après 30s (si retries > 0 ou infini)
+                   │
+                   └─► BlackrockAbortError ──► Arrêt immédiat (pas de réessai)
+```
 
-Le module utilise un système d'événements pour notifier les consommateurs du résultat des appels, qu'ils soient réussis ou échoués, en émettant des événements dans le format `<eventScope-rock-processed>`.
+**Au démarrage**, `Blackrock.init()` interroge la base de données pour récupérer tous les rocks non traités (`processed = false`) ayant encore des tentatives disponibles (`retries != 0`), et relance leur traitement. En mode `development`, ce comportement est désactivé.
+
+**L'interruption** d'un appel en cours se fait via `Blackrock.break()`, qui marque le Rock comme `trashed` et stoppe le `Launcher`.
+
+**L'annulation définitive** d'un appel (depuis la quête cible elle-même) est possible en levant une `BlackrockAbortError`, qui provoque l'arrêt immédiat sans nouvelle tentative.
 
 ## Exemples d'utilisation
 
 ### Lancer un appel avec réessai automatique
 
 ```javascript
+const {Blackrock} = require('goblin-blackrock');
+
 // Dans une méthode d'un acteur Elf
 async hurlSomething() {
-  // Obtenir une référence à l'acteur Blackrock
   const blackrock = new Blackrock(this);
 
-  // Écouter le résultat
-  this.quest.sub(`<myEventScope-rock-processed>`, (err, {msg}) => {
+  // Souscrire aux notifications de résultat
+  this.quest.sub('<myEventScope-rock-processed>', (err, {msg}) => {
     const {baseId, result, error} = msg.data;
     if (error) {
-      // Gérer l'erreur après épuisement des tentatives
       console.error(`Operation ${baseId} failed:`, error);
     } else {
-      // Traiter le résultat en cas de succès
       console.log(`Operation ${baseId} succeeded:`, result);
     }
   });
 
-  // Lancer un appel avec réessai
+  // Lancer avec 5 tentatives maximum
   await blackrock.hurl(
-    'my-operation-id',           // ID de base pour cette opération
-    'myEventScope',              // Portée d'événement pour les notifications
-    'myGoblin',                  // Nom du goblin cible
-    'doSomething',               // Nom de la quête à exécuter
-    {param1: 'value1'},          // Paramètres de la quête
-    5                            // Nombre de tentatives (undefined pour infini)
+    'my-operation-id',   // ID de base
+    'myEventScope',      // Portée d'événement pour les notifications
+    'myGoblin',          // Nom du goblin cible
+    'doSomething',       // Nom de la quête à exécuter
+    {param1: 'value1'},  // Paramètres de la quête
+    5                    // Nombre de tentatives (null/undefined = infini)
   );
 }
 ```
@@ -71,121 +94,132 @@ async hurlSomething() {
 ### Annuler un appel en cours
 
 ```javascript
-// Dans une méthode d'un acteur Elf
-async breakSomething() {
-  // Obtenir une référence à l'acteur Blackrock
-  const blackrock = new Blackrock(this);
-
-  // Annuler un appel en cours
-  await blackrock.break('my-operation-id');
-}
+const blackrock = new Blackrock(this);
+await blackrock.break('my-operation-id');
 ```
 
-### Appel avec délai initial
+### Interrompre définitivement depuis la quête cible
 
 ```javascript
-// Lancer un appel avec un délai de 30 secondes avant la première tentative
-const rock = await new Rock(this).create('delayed-operation', desktopId);
-await rock.upsert('myScope', 'myGoblin', 'delayedQuest', {data: 'test'}, 3);
-await rock.process(true); // true pour activer le délai initial
+const {BlackrockAbortError} = require('goblin-blackrock');
+
+// Dans la quête ciblée par un Rock
+async doSomething(quest, params) {
+  try {
+    // ...
+  } catch (ex) {
+    // Lever cette erreur pour stopper les réessais
+    throw new BlackrockAbortError(ex);
+  }
+}
 ```
 
 ## Interactions avec d'autres modules
 
-- **[xcraft-core-goblin]** : Utilise le framework Elf pour la définition des acteurs et la gestion de l'état
-- **[xcraft-core-stones]** : Utilise les types de données pour définir les formes (shapes) des états
-- **[xcraft-core-utils]** : Dépendance pour les utilitaires de base du framework Xcraft
-- **Système d'événements Xcraft** : Utilise les événements pour notifier les consommateurs des résultats
-- **Système de persistance Cryo** : Utilise la persistance pour stocker et récupérer les rocks non traités
-
-Le module s'intègre dans l'écosystème Xcraft en fournissant une abstraction pour les appels asynchrones fiables, utilisable par n'importe quel autre service ou goblin.
+- **[xcraft-core-goblin]** — Fournit les abstractions `Elf`, `Elf.Alone`, `Elf.Archetype`, `Elf.Spirit` et `SmartId` utilisés pour définir les acteurs et gérer leur état.
+- **[xcraft-core-stones]** — Fournit les types (`string`, `boolean`, `number`, `option`, `object`, `enumeration`) utilisés dans les shapes.
+- **[xcraft-core-utils]** — Dépendance utilitaire de base du framework Xcraft.
+- **Système de persistance Cryo** — Utilisé pour stocker et requêter les rocks (`RockLogic.db = 'rock'`), permettant la reprise après redémarrage.
+- **Bus Xcraft** — Les événements `<kill-the-rock>` et `<eventScope-rock-processed>` sont propagés sur le bus pour coordonner les acteurs.
 
 ## Détails des sources
 
 ### `blackrock.js`
 
-Ce fichier expose les commandes Xcraft pour l'acteur `Blackrock` via `Elf.birth()`, permettant au système de charger automatiquement l'acteur sur le bus Xcraft.
+Point d'entrée du module qui expose les commandes Xcraft de l'acteur `Blackrock` via `Elf.birth()`. Ce fichier permet au serveur Xcraft de charger automatiquement l'acteur sur le bus au démarrage.
 
 ### `rock.js`
 
-Ce fichier expose les commandes Xcraft pour l'acteur `Rock` via `Elf.birth()`, permettant au système de charger automatiquement l'acteur sur le bus Xcraft.
+Point d'entrée qui expose les commandes Xcraft de l'acteur `Rock` via `Elf.birth()`.
 
 ### `lib/blackrock.js`
 
-Ce fichier définit l'acteur `Blackrock` et sa logique associée `BlackrockLogic`. En tant que singleton (`Elf.Alone`), il est responsable de l'orchestration des appels asynchrones avec réessai.
+Définit l'acteur singleton `Blackrock` (`Elf.Alone`) et sa logique `BlackrockLogic`. C'est le point d'entrée public pour les consommateurs du module.
 
 #### État et modèle de données
+
+L'état de `Blackrock` est intentionnellement minimal :
 
 ```javascript
 class BlackrockShape {
-  id = string;
+  id = string; // Toujours 'blackrock'
 }
 ```
 
-L'état de Blackrock est minimal, ne contenant qu'un identifiant fixe : `'blackrock'`.
-
 #### Méthodes publiques
 
-- **`init()`** — Méthode d'initialisation appelée au démarrage qui récupère tous les rocks non traités depuis la base de données et relance leur traitement automatiquement. Configure également la souscription aux événements `<kill-the-rock>` pour nettoyer les ressources.
-- **`hurl(baseId, eventScope, goblinName, questName, params, retries)`** — Lance un nouvel appel asynchrone avec stratégie de réessai. Crée un acteur Rock avec l'ID spécifié, configure ses paramètres et démarre son traitement.
-- **`break(baseId)`** — Annule un appel en cours en récupérant le Rock correspondant et en appelant sa méthode `trash()`. L'opération de suppression est différée pour éviter les conflits de concurrence.
+- **`init()`** — Initialisation du singleton au démarrage. Interroge la base de données `rock` pour récupérer les rocks non traités ayant encore des tentatives disponibles et relance leur traitement. Configure la souscription à l'événement global `*::*.<kill-the-rock>` pour nettoyer les acteurs Rock terminés. Désactivée en mode `NODE_ENV=development`.
+- **`hurl(baseId, eventScope, goblinName, questName, params, retries)`** — Lance un nouvel appel asynchrone avec stratégie de réessai. Construit l'ID `rock@<baseId>` via `SmartId`, crée un acteur `Rock`, configure ses paramètres via `upsert` et démarre le traitement. Le paramètre `retries` peut être `null` ou `undefined` pour des tentatives infinies.
+- **`break(baseId)`** — Annule un appel en cours. Vérifie d'abord l'existence du Rock dans la DB, appelle `rock.trash()` et différe la suppression de l'acteur via `quest.defer`.
+
+#### `BlackrockAbortError`
+
+Classe d'erreur exportée permettant d'interrompre définitivement un Rock sans nouveaux réessais :
+
+```javascript
+const {BlackrockAbortError} = require('goblin-blackrock');
+throw new BlackrockAbortError(originalError);
+```
+
+Propriétés : `name` (`'BlackrockAbortError'`), `message`, `code`, `stack`, `exception` (erreur originale).
 
 ### `lib/rock.js`
 
-Ce fichier contient la logique principale du système avec l'acteur `Rock`, sa logique `RockLogic` et la classe utilitaire `Launcher`. Il implémente la persistance via `Elf.Archetype` avec la base de données 'rock'.
+Contient la logique principale du système : l'acteur `Rock`, sa logique de persistance `RockLogic` et la classe interne `Launcher`.
 
 #### État et modèle de données
 
 ```javascript
+class MetaShape {
+  status = enumeration('published', 'trashed');
+}
+
 class RockShape {
-  id = string; // Identifiant unique du rock
-  meta = MetaShape; // Métadonnées avec statut
+  id = string; // Identifiant unique (rock@<baseId>)
+  meta = MetaShape; // Métadonnées : statut 'published' | 'trashed'
   eventScope = string; // Portée d'événement pour les notifications
   goblinName = string; // Nom du goblin cible
   questName = string; // Nom de la quête à exécuter
   params = option(object); // Paramètres de la quête (optionnel)
-  processed = boolean; // Indique si le rock a été traité
-  retries = option(number); // Nombre de tentatives restantes
+  processed = boolean; // true si l'appel a réussi
+  retries = option(number); // Nombre de tentatives restantes (null = infini)
   error = option(string); // Dernière erreur rencontrée (optionnel)
-}
-
-class MetaShape {
-  status = enumeration('published', 'trashed');
 }
 ```
 
-#### Méthodes publiques
+La base de données utilisée est `'rock'` (`RockLogic.db = 'rock'`).
 
-- **`create(id, desktopId)`** — Crée un nouveau Rock avec l'ID spécifié et le persiste immédiatement. Retourne l'instance pour permettre le chaînage des méthodes.
-- **`upsert(eventScope, goblinName, questName, params, retries)`** — Met à jour les paramètres d'un Rock existant si celui-ci n'est pas déjà en cours de traitement. Retourne `true` si la mise à jour a été effectuée, `false` sinon.
-- **`process(initialDelay = false)`** — Démarre l'exécution de l'appel avec la stratégie de réessai. Crée un `Launcher` qui gère les tentatives et écoute les événements de succès/échec. Le paramètre `initialDelay` permet d'attendre 30 secondes avant la première tentative.
-- **`done()`** — Marque un Rock comme traité avec succès, supprime l'erreur éventuelle et émet un événement `<kill-the-rock>` pour déclencher la suppression de l'acteur.
-- **`setError(error)`** — Enregistre une erreur survenue lors de l'exécution et persiste l'état mis à jour.
-- **`trash()`** — Marque un Rock comme supprimé, arrête le launcher et émet un événement `<kill-the-rock>` pour déclencher la suppression de l'acteur.
-- **`delete()`** et **`dispose()`** — Nettoient les ressources en arrêtant le launcher pour éviter les fuites mémoire.
+#### Méthodes publiques de `Rock`
 
-#### Classe Launcher
+- **`create(id, desktopId)`** — Crée un nouveau Rock avec l'ID spécifié et le persiste immédiatement. Retourne `this` pour le chaînage.
+- **`upsert(eventScope, goblinName, questName, params, retries)`** — Met à jour les paramètres du Rock et réinitialise son état (`processed = false`, `status = 'published'`). Retourne `false` si le Rock est déjà en cours de traitement, `true` sinon.
+- **`process(initialDelay = false)`** — Démarre l'exécution via un `Launcher`. Si `initialDelay` est `true`, attend 30 secondes avant la première tentative. Sans effet si déjà en cours de traitement.
+- **`done()`** — Marque le Rock comme traité avec succès, supprime l'erreur et émet `<kill-the-rock>` pour déclencher la suppression de l'acteur.
+- **`setError(error)`** — Enregistre l'erreur de la dernière tentative et persiste l'état.
+- **`trash()`** — Arrête le `Launcher`, passe le statut à `'trashed'` et émet `<kill-the-rock>`.
+- **`delete()`** — Arrête le `Launcher` (appelé lors de la suppression de l'acteur).
+- **`dispose()`** — Arrête le `Launcher` lors de la fermeture de l'application.
 
-La classe `Launcher` est un composant clé qui étend `EventEmitter` et gère l'exécution des appels avec la stratégie de réessai :
+#### Classe `Launcher` (interne)
 
-**Caractéristiques :**
+`Launcher` étend `EventEmitter` et gère l'exécution des appels avec réessai automatique.
 
-- **Intervalle de réessai** : 30 secondes entre chaque tentative
-- **Gestion des tentatives** : Décrémente le compteur de `retries` à chaque échec (si défini)
-- **Délai initial** : Optionnel, permet d'attendre avant la première exécution
-- **Événements** : Émet 'success' avec le résultat ou 'error' avec l'erreur
-- **Arrêt automatique** : S'arrête en cas de succès ou d'épuisement des tentatives
+Comportement clé :
 
-**Méthodes :**
+- **Intervalle de réessai** : 30 secondes (`#timeInterval = 30000`) entre chaque tentative
+- **Délai initial** : optionnel, retarde la première tentative de 30 secondes
+- **Protection contre les exécutions concurrentes** : le flag `#running` empêche les appels parallèles
+- **Stratégie de réessai** : si `retries` est un nombre, il est décrémenté à chaque échec ; si `retries` vaut 0 après décrémentation, les réessais s'arrêtent. Si `retries` est `null`/`undefined`, les réessais sont infinis
+- **Abort sans réessai** : une `BlackrockAbortError` stoppe immédiatement les réessais
+- **Événements émis** : `'success'` (avec le résultat) et `'error'` (avec l'exception)
 
-- **`constructor(context, goblinName, questName, params, options)`** — Initialise le launcher avec les paramètres d'appel et démarre l'exécution
-- **`stop()`** — Arrête le launcher et nettoie les timers
+## Licence
 
-Cette implémentation garantit que les appels sont exécutés de manière fiable, même en cas de défaillances temporaires du système, avec une stratégie de réessai configurable et une gestion propre des ressources.
+Ce module est distribué sous [licence MIT](./LICENSE).
 
 ---
 
-_Cette documentation a été mise à jour automatiquement._
+_Ce contenu a été généré par IA_
 
 [xcraft-core-goblin]: https://github.com/Xcraft-Inc/xcraft-core-goblin
 [xcraft-core-stones]: https://github.com/Xcraft-Inc/xcraft-core-stones
